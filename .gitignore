@@ -1,2 +1,8 @@
 *.pyc
 extractors/.dlhd_cache
+flaresolverr/
+byparr/
+.env
+/scratch
+/.shared_chromium_profile
+dlstreams_activity.txt

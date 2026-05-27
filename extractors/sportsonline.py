@@ -1,16 +1,15 @@
 import asyncio
+import base64
 import logging
 import re
 import json
 from urllib.parse import urlparse, urljoin
 from typing import Dict, Any
-import gzip
-import zlib
 import random
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
-import zstandard  # Importa la libreria zstandard
-from aiohttp_socks import ProxyConnector
+from config import get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy
+
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +64,7 @@ class SportsonlineExtractor:
         self.session = None
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self._session_lock = asyncio.Lock()
-        self.proxies = proxies or []
+        self.proxies = proxies or GLOBAL_PROXIES
 
     def _get_random_proxy(self):
         return random.choice(self.proxies) if self.proxies else None
@@ -152,13 +151,20 @@ class SportsonlineExtractor:
             )
         )
 
-    async def _get_session(self):
+    async def _get_session(self, url: str = None):
         if self.session is None or self.session.closed:
             timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
+            
+            # Determina il proxy per l'URL (se fornito)
+            proxy = None
+            if url:
+                proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies)
+            else:
+                proxy = self._get_random_proxy()
+                
             if proxy:
-                logger.info(f"Using proxy {proxy} for Sportsonline session.")
-                connector = ProxyConnector.from_url(proxy)
+                logger.debug(f"Using proxy {proxy} for Sportsonline session.")
+                connector = get_connector_for_proxy(proxy)
             else:
                 connector = TCPConnector(limit=0, limit_per_host=0)
 
@@ -171,59 +177,33 @@ class SportsonlineExtractor:
         return self.session
 
     async def _make_robust_request(
-        self, url: str, headers: dict = None, retries=3, initial_delay=2, timeout=15
+        self, url: str, headers: dict = None, retries=2, initial_delay=1, timeout=15
     ):
+        """Effettua richieste HTTP robuste con aiohttp e proxy configurati."""
         final_headers = headers or self.base_headers
-        request_headers = final_headers.copy()
-        request_headers["Accept-Encoding"] = "gzip, deflate, zstd"
 
         for attempt in range(retries):
             try:
-                session = await self._get_session()
-                logger.info(f"Attempt {attempt + 1}/{retries} for URL: {url}")
-                async with session.get(
-                    url, headers=request_headers, timeout=timeout, auto_decompress=False
-                ) as response:
+                logger.debug(f"Attempt {attempt + 1}/{retries} for URL: {url}")
+                session = await self._get_session(url)
+                async with session.get(url, headers=final_headers, timeout=timeout) as response:
                     response.raise_for_status()
-                    content = await self._handle_response_content(response)
-                    # We return both content and the final URL to match user snippet
-                    return content, str(response.url)
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.warning(
-                    f"⚠️ Connection error attempt {attempt + 1} for {url}: {str(e)}"
-                )
-                if attempt < retries - 1:
-                    delay = initial_delay * (2**attempt)
-                    await asyncio.sleep(delay)
-                else:
-                    raise ExtractorError(
-                        f"All {retries} attempts failed for {url}: {str(e)}"
-                    )
+                    html = await self._handle_response_content(response)
+                    if not html:
+                        raise ExtractorError(f"Empty response for {url}")
+                    return html, str(response.url)
+
             except Exception as e:
-                logger.exception(f"Error in _make_robust_request for {url}")
-                raise ExtractorError(f"Error in robust request: {str(e)}")
+                logger.warning(f"Request attempt {attempt + 1} failed for {url}: {str(e)}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(initial_delay)
+                else:
+                    raise ExtractorError(f"All request attempts failed for {url}: {str(e)}")
         raise ExtractorError(f"Unable to complete request for {url}")
-
     async def _handle_response_content(self, response: aiohttp.ClientResponse) -> str:
-        """Gestisce la decompressione manuale del corpo della risposta."""
-        content_encoding = response.headers.get("Content-Encoding")
+        """Read response body; aiohttp already handles standard decompression."""
         raw_body = await response.read()
-
-        if content_encoding == "zstd":
-            dctx = zstandard.ZstdDecompressor()
-            try:
-                decompressed_body = dctx.decompress(raw_body, max_output_size=104857600)
-                return decompressed_body.decode(response.charset or "utf-8")
-            except zstandard.ZstdError as zs_e:
-                raise ExtractorError(f"Zstd decompression error: {zs_e}")
-        elif content_encoding == "gzip":
-            decompressed_body = gzip.decompress(raw_body)
-            return decompressed_body.decode(response.charset or "utf-8")
-        elif content_encoding == "deflate":
-            decompressed_body = zlib.decompress(raw_body)
-            return decompressed_body.decode(response.charset or "utf-8")
-        else:
-            return raw_body.decode(response.charset or "utf-8")
+        return raw_body.decode(response.charset or "utf-8", errors="replace")
 
     def _detect_packed_blocks(self, html: str) -> list[str]:
         raw_matches: list[str] = []
@@ -271,6 +251,46 @@ class SportsonlineExtractor:
         return None
 
     @staticmethod
+    def _extract_econfig_m3u8(html: str) -> str | None:
+        """Decode current dynmill player config and return its stream URL."""
+        config_match = re.search(r"window\._econfig\s*=\s*['\"]([^'\"]+)['\"]", html)
+        if not config_match:
+            return None
+
+        try:
+            encoded_config = config_match.group(1)
+            decoded_config = base64.b64decode(
+                encoded_config + "=" * (-len(encoded_config) % 4)
+            ).decode("latin1")
+
+            part_order = [2, 0, 3, 1]
+            part_length = -(-len(decoded_config) // 4)
+            encoded_parts = []
+            offset = 0
+
+            for _ in range(4):
+                part = decoded_config[offset : offset + part_length]
+                offset += part_length
+                encoded_parts.append(part[:3] + part[4:])
+
+            decoded_parts = [""] * 4
+            for index, part in enumerate(encoded_parts):
+                decoded_parts[part_order[index]] = base64.b64decode(
+                    part + "=" * (-len(part) % 4)
+                ).decode("latin1")
+
+            joined_config = "".join(decoded_parts)
+            config_json = base64.b64decode(
+                joined_config + "=" * (-len(joined_config) % 4)
+            ).decode("utf-8")
+            config = json.loads(config_json)
+        except Exception as e:
+            logger.debug(f"Failed to decode Sportsonline _econfig: {e}")
+            return None
+
+        return config.get("stream_url_nop2p") or config.get("stream_url")
+
+    @staticmethod
     def _normalize_stream_url(stream_url: str, base_url: str) -> str:
         cleaned = stream_url.strip().strip("\"'").replace("\\/", "/")
         if cleaned.startswith("//"):
@@ -291,7 +311,7 @@ class SportsonlineExtractor:
             user_agent = self._get_request_header("User-Agent", self.base_headers["User-Agent"])
 
             # Step 1: Fetch main page
-            logger.info(f"Fetching main page: {url}")
+            logger.debug(f"Fetching main page: {url}")
             main_headers = self._build_page_headers()
             if source_referer:
                 main_headers["Referer"] = source_referer
@@ -313,7 +333,7 @@ class SportsonlineExtractor:
 
             if iframe_match:
                 iframe_url = self._normalize_stream_url(iframe_match.group(1), main_url)
-                logger.info(f"Found iframe URL: {iframe_url}")
+                logger.debug(f"Found iframe URL: {iframe_url}")
 
                 candidates = [iframe_url]
                 parsed_iframe = urlparse(iframe_url)
@@ -350,15 +370,18 @@ class SportsonlineExtractor:
             # Step 3: Detect packed blocks
             packed_blocks = self._detect_packed_blocks(iframe_html)
 
-            logger.info(f"Found {len(packed_blocks)} packed blocks")
+            logger.debug(f"Found {len(packed_blocks)} packed blocks")
 
             if not packed_blocks:
                 logger.warning("No packed blocks found, trying direct m3u8 search")
                 # Fallback: try direct m3u8 search
-                direct_match = self._extract_m3u8_candidate(iframe_html)
+                direct_match = (
+                    self._extract_m3u8_candidate(iframe_html)
+                    or self._extract_econfig_m3u8(iframe_html)
+                )
                 if direct_match:
                     m3u8_url = self._normalize_stream_url(direct_match, iframe_url)
-                    logger.info(f"Found direct m3u8 URL: {m3u8_url}")
+                    logger.debug(f"Found direct m3u8 URL: {m3u8_url}")
 
                     return {
                         "destination_url": m3u8_url,
@@ -373,12 +396,12 @@ class SportsonlineExtractor:
             m3u8_url = None
             unpacked_code = None
 
-            logger.info(f"Chosen packed block index: {chosen_idx}")
+            logger.debug(f"Chosen packed block index: {chosen_idx}")
 
             # Try to unpack chosen block
             try:
                 unpacked_code = extract_unpack(packed_blocks[chosen_idx])
-                logger.info(f"Successfully unpacked block {chosen_idx}")
+                logger.debug(f"Successfully unpacked block {chosen_idx}")
             except Exception as e:
                 logger.warning(f"Failed to unpack block {chosen_idx}: {e}")
 
@@ -388,7 +411,7 @@ class SportsonlineExtractor:
 
             # If not found, try all other blocks
             if not m3u8_url:
-                logger.info("m3u8 not found in chosen block, trying all blocks")
+                logger.debug("m3u8 not found in chosen block, trying all blocks")
                 for i, block in enumerate(packed_blocks):
                     if i == chosen_idx:
                         continue
@@ -396,7 +419,7 @@ class SportsonlineExtractor:
                         unpacked_code = extract_unpack(block)
                         m3u8_url = self._extract_m3u8_candidate(unpacked_code)
                         if m3u8_url:
-                            logger.info(f"Found m3u8 in block {i}")
+                            logger.debug(f"Found m3u8 in block {i}")
                             break
                     except Exception as e:
                         logger.debug(f"Failed to process block {i}: {e}")
@@ -404,6 +427,8 @@ class SportsonlineExtractor:
 
             if not m3u8_url:
                 fallback_candidate = self._extract_m3u8_candidate(iframe_html)
+                if not fallback_candidate:
+                    fallback_candidate = self._extract_econfig_m3u8(iframe_html)
                 if fallback_candidate:
                     m3u8_url = fallback_candidate
 

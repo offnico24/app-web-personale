@@ -2,41 +2,67 @@ import base64
 import yarl
 import json
 import logging
-import random
 import re
 import urllib.parse
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import aiohttp
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from aiohttp_socks import ProxyConnector
+from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT, get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES
+from curl_cffi.requests import AsyncSession
 
 logger = logging.getLogger(__name__)
 
 class ExtractorError(Exception):
-    """Exception for extraction errors."""
     pass
 
 class CinemaCityExtractor:
-    """CinemaCity m3u8 extractor (Direct URL only)."""
+    """CinemaCity m3u8 extractor (FlareSolverr CF + curl_cffi requests)."""
 
     def __init__(self, request_headers: dict, proxies: list = None):
         self.request_headers = request_headers
-        self.proxies = proxies or []
-        self.session = None
-        self.user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        self.proxies = proxies or GLOBAL_PROXIES
+        self._cookies = None
+        self._user_agent = None
         self.base_url = "https://cinemacity.cc"
+        self.flaresolverr_url = FLARESOLVERR_URL
+        self.flaresolverr_timeout = FLARESOLVERR_TIMEOUT
 
-    def _get_random_proxy(self):
-        return random.choice(self.proxies) if self.proxies else None
+    async def _ensure_cookies(self):
+        if self._cookies and self._user_agent:
+            return
+        endpoint = f"{self.flaresolverr_url.rstrip('/')}/v1"
+        payload = {"cmd": "request.get", "url": self.base_url, "maxTimeout": (self.flaresolverr_timeout + 60) * 1000}
+        async with aiohttp.ClientSession() as s:
+            async with s.post(endpoint, json=payload, timeout=aiohttp.ClientTimeout(total=self.flaresolverr_timeout + 95)) as r:
+                d = await r.json()
+        if d.get("status") != "ok":
+            raise ExtractorError(f"FlareSolverr: {d.get('message', '')}")
+        self._cookies = {c["name"]: c["value"] for c in d["solution"].get("cookies", [])}
+        self._user_agent = d["solution"].get("userAgent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        logger.info(f"CinemaCity: FS cookies: {list(self._cookies.keys())}")
 
-    async def _get_session(self):
-        if self.session is None or self.session.closed:
-            timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
-            connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(limit=0, use_dns_cache=True)
-            self.session = ClientSession(timeout=timeout, connector=connector, headers={'User-Agent': self.user_agent})
-        return self.session
+    def _build_cookie_str(self, extra_cookies: str = "") -> str:
+        parts = [f"{k}={v}" for k, v in self._cookies.items()]
+        if extra_cookies:
+            parts.append(extra_cookies)
+        return "; ".join(parts)
+
+    async def _fetch_page(self, url: str, session_cookies: str = "") -> tuple[str, dict]:
+        await self._ensure_cookies()
+        cookie_str = self._build_cookie_str(session_cookies)
+
+        async with AsyncSession(impersonate="chrome124") as sess:
+            r = await sess.get(url, headers={
+                "User-Agent": self._user_agent,
+                "Cookie": cookie_str,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Referer": "https://cinemacity.cc/",
+            })
+            html = r.text
+            resp_cookies = dict(r.cookies) if hasattr(r, 'cookies') else {}
+            logger.info(f"CinemaCity: curl_cffi status={r.status_code} len={len(html)}")
+            return html, resp_cookies
 
     def base64_decode(self, data: str) -> str:
         try:
@@ -48,8 +74,7 @@ class CinemaCityExtractor:
         except: return ""
 
     def get_session_cookies(self) -> str:
-        # Fixed login cookies
-        return self.base64_decode("ZGxlX3VzZXJfaWQ9MzI3Mjk7IGRsZV9wYXNzd29yZD04OTQxNzFjNmE4ZGFiMThlZTU5NGQ1YzY1MjAwOWEzNTs=")
+        return self.base64_decode("ZGxlX3VzZXJfaWQ9NDg4Mjc7IGRsZV9wYXNzd29yZD03N2VjM2E4MTZjOThmMTRlZWI5M2RlNGI0YWM0ZjBiZDs=")
 
     def extract_json_array(self, decoded: str) -> Optional[str]:
         start = decoded.find("file:")
@@ -64,14 +89,25 @@ class CinemaCityExtractor:
             if depth == 0: return decoded[start:i+1]
         return None
 
+    def _collect_file_entries(self, items) -> list[dict]:
+        entries = []
+        if isinstance(items, list):
+            for item in items:
+                entries.extend(self._collect_file_entries(item))
+        elif isinstance(items, dict):
+            if isinstance(items.get("file"), str) and items.get("file"):
+                entries.append(items)
+            folder = items.get("folder")
+            if isinstance(folder, list):
+                entries.extend(self._collect_file_entries(folder))
+        return entries
+
     def pick_stream(self, file_data, media_type: str, season: int = 1, episode: int = 1) -> Optional[str]:
         if isinstance(file_data, str): return file_data
         if isinstance(file_data, list):
-            # Movie or flat list
             if media_type == 'movie' or all(isinstance(x, dict) and "file" in x and "folder" not in x for x in file_data):
                 return file_data[0].get('file') if file_data else None
 
-            # Series (Season -> Episode)
             selected_season = None
             for s in file_data:
                 if not isinstance(s, dict) or "folder" not in s: continue
@@ -87,7 +123,8 @@ class CinemaCityExtractor:
             if not selected_season: return None
 
             selected_ep = None
-            for e in selected_season:
+            episode_candidates = self._collect_file_entries(selected_season)
+            for e in episode_candidates:
                 if not isinstance(e, dict) or "file" not in e: continue
                 title = e.get('title', "").lower()
                 if re.search(rf"(?:episode|episodio|e)\s*0*{episode}\b", title, re.I):
@@ -95,100 +132,161 @@ class CinemaCityExtractor:
                     break
             if not selected_ep:
                 idx = max(0, int(episode) - 1)
-                ep_data = selected_season[idx] if idx < len(selected_season) else selected_season[0]
-                selected_ep = ep_data.get('file')
+                if episode_candidates:
+                    ep_data = episode_candidates[idx] if idx < len(episode_candidates) else episode_candidates[0]
+                    selected_ep = ep_data.get('file')
+
+            if selected_ep:
+                logger.debug(f"CinemaCity: Selected S{season}E{episode} -> {selected_ep[:50]}...")
+            else:
+                logger.warning(f"CinemaCity: Failed to find S{season}E{episode} in file_data")
             return selected_ep
         return None
 
-    async def extract(self, url: str, **kwargs) -> dict:
-        session = await self._get_session()
-        cookies = self.get_session_cookies()
-        
-        # Get params from kwargs or URL query
-        media_type = kwargs.get('type', 'movie')
-        season = int(kwargs.get('s', kwargs.get('season', 1)))
-        episode = int(kwargs.get('e', kwargs.get('episode', 1)))
-
-        headers = {
-            "User-Agent": self.user_agent,
-            "Cookie": cookies,
-            "Referer": f"{self.base_url}/"
-        }
-
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200: raise ExtractorError(f"HTTP {response.status}")
-            html = await response.text()
-
-        # Find player for referer
-        iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']*player\.php[^"\']*)["\']', html, re.I)
-        player_referer = urllib.parse.urljoin(url, iframe_match.group(1)) if iframe_match else url
-
-        # Scrape atob chunks
-        file_data = None
-        for match in re.finditer(r'atob\s*\(\s*["\'](.*?)["\']\s*\)', html, re.I):
+    def _parse_atob_data(self, html: str) -> any:
+        for match in re.finditer(r'(?:window\.)?atob\s*\(\s*["\'](.*?)["\']\s*\)', html, re.I):
             encoded = match.group(1)
             if len(encoded) < 50: continue
             decoded = self.base64_decode(encoded)
             if not decoded: continue
-            
+
             if decoded.strip().startswith("["):
                 try:
-                    file_data = json.loads(decoded)
-                    if file_data: break
-                except: pass
-            
+                    data = json.loads(decoded)
+                    if data: return data
+                except json.JSONDecodeError:
+                    pass
+
             raw_json = self.extract_json_array(decoded)
             if raw_json:
                 try:
                     clean = re.sub(r'\\(.)', r'\1', raw_json)
-                    file_data = json.loads(clean)
-                except:
-                    try: file_data = json.loads(raw_json)
-                    except: pass
-                if file_data: break
-            
+                    data = json.loads(clean)
+                except json.JSONDecodeError:
+                    try:
+                        data = json.loads(raw_json)
+                    except json.JSONDecodeError:
+                        pass
+                if data: return data
+
+            # Playerjs file param: file:'[{"title":"TS","file":"https://...",...}]'
+            pj_match = re.search(r"file\s*:\s*'(\[.*?\])'", decoded, re.I | re.S)
+            if pj_match:
+                raw_json_str = pj_match.group(1).replace("\\'", "'").replace('\\"', '"')
+                try:
+                    data = json.loads(raw_json_str)
+                    if data: return data
+                except json.JSONDecodeError:
+                    pass
+
             file_match = re.search(r'(?:file|sources)\s*:\s*["\'](.*?)["\']', decoded, re.I)
             if file_match:
                 f_url = file_match.group(1)
                 if '.m3u8' in f_url or '.mp4' in f_url:
-                    file_data = f_url
-                    break
+                    return f_url
+        return None
 
-        if not file_data: raise ExtractorError("Stream not found")
+    def _parse_script_data(self, html: str) -> any:
+        for script_match in re.finditer(r'<script[^>]*>(.*?)</script>', html, re.I | re.S):
+            script = script_match.group(1)
+            if not script: continue
+
+            for pattern in [r'file\s*:\s*(\[.*?\])\s*[,;]', r'sources\s*:\s*(\[.*?\])\s*[,;]']:
+                match = re.search(pattern, script, re.I | re.S)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                        if data: return data
+                    except json.JSONDecodeError:
+                        pass
+
+            url_match = re.search(r'["\'](https?://[^"\']*\.m3u8[^"\']*)["\']', script)
+            if url_match:
+                return url_match.group(1)
+
+        for pattern in [r'file:\s*(\[.*?\])\s*}', r'sources:\s*(\[.*?\])\s*}']:
+            match = re.search(pattern, html, re.I | re.S)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    if data: return data
+                except json.JSONDecodeError:
+                    pass
+        return None
+
+    async def extract(self, url: str, **kwargs) -> dict:
+        cookies = self.get_session_cookies()
+
+        media_type = kwargs.get('type')
+        if not media_type:
+            lowered_url = url.lower()
+            if "/tv-series/" in lowered_url or "/serie-tv/" in lowered_url:
+                media_type = "series"
+            else:
+                media_type = "movie"
+
+        url_params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+
+        s_val = kwargs.get('s') or kwargs.get('season') or url_params.get('s', [None])[0] or url_params.get('season', ['1'])[0]
+        e_val = kwargs.get('e') or kwargs.get('episode') or url_params.get('e', [None])[0] or url_params.get('episode', ['1'])[0]
+
+        season = int(s_val) if str(s_val).isdigit() else 1
+        episode = int(e_val) if str(e_val).isdigit() else 1
+        if media_type == "movie" and (url_params.get('s') or url_params.get('season') or url_params.get('e') or url_params.get('episode')):
+            media_type = "series"
+
+        html, dynamic_cookies = await self._fetch_page(url, cookies)
+
+        if not html or len(html) < 100:
+            logger.warning(f"CinemaCity: failed to fetch page (len={len(html)})")
+            raise ExtractorError("Failed to retrieve page content")
+
+        file_data = self._parse_atob_data(html)
+        if not file_data:
+            file_data = self._parse_script_data(html)
+
+        if not file_data:
+            logger.warning("CinemaCity: no stream data in page (len=%d)", len(html))
+            snippet = html[3000:5000] if len(html) > 5000 else html[:2000]
+            logger.debug("CinemaCity snippet: %s", snippet[:500])
+            raise ExtractorError("Stream not found")
+
+        iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']*player\.php[^"\']*)["\']', html, re.I)
+        player_referer = urllib.parse.urljoin(url, iframe_match.group(1)) if iframe_match else url
+
         stream_url = self.pick_stream(file_data, media_type, season, episode)
         if not stream_url: raise ExtractorError("Pick failed")
 
-        # Use yarl to prevent auto-encoding of commas in multi-stream URLs
         safe_url = str(yarl.URL(stream_url, encoded=True))
-        
-        # Clean cookie logic - Browser uses trailing semicolon
-        clean_cookies = cookies.strip()
-        if not clean_cookies.endswith(';'):
-            clean_cookies += ';'
+
+        merged_cookies = {}
+        for c in cookies.split(";"):
+            if "=" in c:
+                k, v = c.strip().split("=", 1)
+                merged_cookies[k] = v
+        if self._cookies:
+            merged_cookies.update(self._cookies)
+        if dynamic_cookies:
+            merged_cookies.update(dynamic_cookies)
+
+        clean_cookies = "; ".join([f"{k}={v}" for k, v in merged_cookies.items()]).strip().rstrip(';')
+
+        try:
+            origin = urllib.parse.urlparse(url)
+            origin_str = f"{origin.scheme}://{origin.netloc}"
+        except Exception:
+            origin_str = self.base_url
 
         return {
             "destination_url": safe_url,
             "request_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-                "Upgrade-Insecure-Requests": "1",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Site": "none",
-                "Sec-Fetch-User": "?1",
-                "Sec-CH-UA": '"Google Chrome";v="147", "Not.A/Brand";v="8", "Chromium";v="147"',
-                "Sec-CH-UA-Mobile": "?0",
-                "Sec-CH-UA-Platform": '"Windows"',
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7,it;q=0.6,fr;q=0.5",
-                "Accept-Encoding": "gzip, deflate, br, zstd",
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache",
-                "priority": "u=0, i",
-                "Cookie": clean_cookies,
-                "Connection": "keep-alive"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Referer": player_referer, "Origin": origin_str,
+                "Cookie": clean_cookies, "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.5", "Connection": "keep-alive"
             },
             "mediaflow_endpoint": "hls_manifest_proxy" if ".m3u8" in safe_url else "proxy_stream_endpoint"
         }
 
     async def close(self):
-        if self.session: await self.session.close()
+        pass

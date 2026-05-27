@@ -8,6 +8,7 @@ from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp_socks import ProxyConnector
 from typing import Optional, Dict, Any
 from urllib.parse import quote_plus
+from config import get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy
 import random
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ class VavooExtractor:
         }
         self.session = None
         self.mediaflow_endpoint = "proxy_stream_endpoint"
-        self.proxies = proxies or []
+        self.proxies = proxies or GLOBAL_PROXIES
         self._cached_sig = None
         self._cached_sig_ts = 0
 
@@ -42,13 +43,20 @@ class VavooExtractor:
         """Restituisce un proxy casuale dalla lista."""
         return random.choice(self.proxies) if self.proxies else None
         
-    async def _get_session(self):
+    async def _get_session(self, url: str = None):
         if self.session is None or self.session.closed:
             timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
+            
+            # Determina il proxy per l'URL (se fornito)
+            proxy = None
+            if url:
+                proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies)
+            else:
+                proxy = self._get_random_proxy()
+                
             if proxy:
-                logger.info(f"Using proxy for Vavoo session.")
-                connector = ProxyConnector.from_url(proxy)
+                logger.debug(f"Using proxy for Vavoo session: {proxy}")
+                connector = get_connector_for_proxy(proxy)
             else:
                 connector = TCPConnector(
                     limit=0,
@@ -73,7 +81,7 @@ class VavooExtractor:
         if self._cached_sig and (time.time() - self._cached_sig_ts) < 300:
             return self._cached_sig
 
-        session = await self._get_session()
+        session = await self._get_session(_LOKKE_PING_URL)
         unique_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:16]
         now_ms = int(time.time() * 1000)
         body = {
@@ -124,7 +132,7 @@ class VavooExtractor:
                         if sig:
                             self._cached_sig = sig
                             self._cached_sig_ts = time.time()
-                            logger.info("Got auth signature from lokke.app")
+                            logger.debug("Got auth signature from lokke.app")
                             return sig
                     logger.warning(f"Ping attempt {attempt+1} failed: status {resp.status}")
             except Exception as e:
@@ -133,7 +141,7 @@ class VavooExtractor:
 
     async def _get_ts_signature(self) -> Optional[str]:
         """Get TS signature via ping2 (fallback)."""
-        session = await self._get_session()
+        session = await self._get_session(_TS_PING2_URL)
         for attempt in range(3):
             try:
                 async with session.post(
@@ -146,7 +154,7 @@ class VavooExtractor:
                         data = await resp.json()
                         signed = data.get("response", {}).get("signed")
                         if signed:
-                            logger.info("Got TS signature from ping2")
+                            logger.debug("Got TS signature from ping2")
                             return signed
             except Exception as e:
                 logger.warning(f"TS ping2 attempt {attempt+1} exception: {e}")
@@ -154,7 +162,7 @@ class VavooExtractor:
 
     async def _resolve_via_mediahubmx(self, url: str, signature: str) -> Optional[str]:
         """Resolve vavoo play URL via mediahubmx-resolve.json."""
-        session = await self._get_session()
+        session = await self._get_session(_RESOLVE_URL)
         headers = {
             "user-agent": "MediaHubMX/2",
             "accept": "application/json",
@@ -209,9 +217,9 @@ class VavooExtractor:
             if resolved_url:
                 logger.info(f"Resolved via mediahubmx: {resolved_url[:80]}...")
                 stream_headers = {
-                    "user-agent": "MediaHubMX/2",
-                    "referer": "https://vavoo.to/",
-                    "origin": "https://vavoo.to",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    "Referer": "https://vavoo.to",
+                    "Origin": "https://vavoo.to",
                 }
 
         # Step 2: Fallback — TS signature via ping2
@@ -235,10 +243,13 @@ class VavooExtractor:
                 "referer": "https://vavoo.to/",
             }
 
+        stream_headers["X-EasyProxy-Disable-SSL"] = "1"
+
         return {
             "destination_url": resolved_url,
             "request_headers": stream_headers,
             "mediaflow_endpoint": self.mediaflow_endpoint,
+            "disable_ssl": True,
         }
 
     async def close(self):

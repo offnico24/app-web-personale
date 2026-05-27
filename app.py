@@ -7,7 +7,7 @@ from aiohttp import web
 # Aggiungi path corrente per import moduli
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from services.hls_proxy import HLSProxy
+from services.proxy import HLSProxy
 from services.ffmpeg_manager import FFmpegManager
 from config import PORT, DVR_ENABLED, RECORDINGS_DIR, MAX_RECORDING_DURATION, RECORDINGS_RETENTION_DAYS
 
@@ -21,6 +21,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
 )
+
+logger = logging.getLogger(__name__)
 
 # --- Logica di Avvio ---
 def create_app():
@@ -68,6 +70,8 @@ def create_app():
     app.router.add_get('/proxy/manifest.m3u8', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/manifest.m3u8', proxy.handle_proxy_request)
     app.router.add_get('/proxy/mpd/manifest.m3u8', proxy.handle_proxy_request)
+    app.router.add_get('/proxy/mpd/manifest.mpd', proxy.handle_proxy_request)
+    app.router.add_get('/proxy/mpd/segment/{session_id}/{tail:.*}', proxy.handle_dash_segment)
     # ✅ NUOVO: Endpoint generico per stream (compatibilità MFP)
     app.router.add_get('/proxy/stream', proxy.handle_proxy_request)
     app.router.add_get('/extractor', proxy.handle_extractor_request)
@@ -80,6 +84,7 @@ def create_app():
     app.router.add_get('/proxy/hls/segment.ts', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/segment.m4s', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/segment.mp4', proxy.handle_proxy_request)
+    app.router.add_get('/proxy/hls/segment.vtt', proxy.handle_proxy_request)
     
     app.router.add_get('/playlist', proxy.handle_playlist_request)
     app.router.add_get('/segment/{segment}', proxy.handle_ts_segment)
@@ -176,7 +181,6 @@ def create_app():
 
     # ✅ NUOVO: Endpoint per ottenere l'IP pubblico
     app.router.add_get('/proxy/ip', proxy.handle_proxy_ip)
-
     # Setup recording/DVR routes (only if enabled)
     if DVR_ENABLED:
         setup_recording_routes(app, recording_manager)
@@ -190,6 +194,7 @@ def create_app():
     
     async def on_startup(app):
         asyncio.create_task(ffmpeg_manager.cleanup_loop())
+        asyncio.create_task(proxy.start_tasks())
         if DVR_ENABLED:
             asyncio.create_task(recording_manager.cleanup_loop())
     app.on_startup.append(on_startup)
@@ -211,17 +216,17 @@ def main():
         # Silenzia il logger di asyncio per evitare spam di ConnectionResetError
         logging.getLogger('asyncio').setLevel(logging.CRITICAL)
 
-    print("🚀 Starting HLS Proxy Server...")
-    print(f"📡 Server available at: http://localhost:{PORT}")
-    print(f"📡 Or: http://server-ip:{PORT}")
-    print("🔗 Endpoints:")
-    print("   • / - Main page")
-    print("   • /builder - Web interface for playlist builder")
-    print("   • /info - Server information page")
-    print("   • /recordings - DVR/Recording interface")
-    print("   • /proxy/manifest.m3u8?url=<URL> - Main stream proxy")
-    print("   • /playlist?url=<definitions> - Playlist generator")
-    print("=" * 50)
+    logger.info("🚀 Starting HLS Proxy Server...")
+    logger.info("📡 Server available at: http://localhost:%s", PORT)
+    logger.info("📡 Or: http://server-ip:%s", PORT)
+    logger.debug("🔗 Endpoints:")
+    logger.debug("   • / - Main page")
+    logger.debug("   • /builder - Web interface for playlist builder")
+    logger.debug("   • /info - Server information page")
+    logger.debug("   • /recordings - DVR/Recording interface")
+    logger.debug("   • /proxy/manifest.m3u8?url=<URL> - Main stream proxy")
+    logger.debug("   • /playlist?url=<definitions> - Playlist generator")
+    logger.debug("%s", "=" * 50)
     
     web.run_app(
         app, # Usa l'istanza aiohttp originale per il runner integrato
